@@ -114,6 +114,15 @@ public class FixAvatarCriticalIssues : EditorWindow
             EditorGUILayout.Space(20);
 
             EditorGUILayout.HelpBox("💡 修正順序:\n1. 衝突停止 → 2. エラー修正 → 3. ビルドテスト\n\n⚠️ 修正後はAOを段階的に再有効化", MessageType.Info);
+
+            // D. 詳細診断
+            DrawSection("D. 詳細診断", new Color(0.8f, 0.9f, 1f), () =>
+            {
+                if (GUILayout.Button("10. 🔍 FaceEmo診断詳細"))
+                {
+                    SafeInvoke(DiagnoseFaceEmoWiring);
+                }
+            });
         }
         catch (System.Exception e)
         {
@@ -530,6 +539,131 @@ public class FixAvatarCriticalIssues : EditorWindow
                 "OK");
         }
     }
+
+    private void DiagnoseFaceEmoWiring()
+    {
+        var avatars = FindObjectsOfType<VRC.SDK3.Avatars.Components.VRCAvatarDescriptor>();
+        if (avatars == null || avatars.Length == 0)
+        {
+            EditorUtility.DisplayDialog("診断", "シーンにVRCAvatarDescriptorが見つかりません。", "OK");
+            return;
+        }
+
+        foreach (var av in avatars)
+        {
+            Debug.Log($"\n===== 🔍 FaceEmo診断: {av.name} =====");
+
+            // 1) Expression Parameters 状況
+            var ep = av.expressionParameters;
+            if (ep == null || ep.parameters == null)
+            {
+                Debug.LogWarning("[Diag] Expression Parameters: 未設定");
+            }
+            else
+            {
+                int cost = 0;
+                foreach (var p in ep.parameters)
+                {
+                    if (p == null) continue;
+                    int add = p.valueType == VRCExpressionsParameters.ValueType.Bool ? 1 : 4;
+                    cost += add;
+                }
+                Debug.Log($"[Diag] Expression Parameters: {ep.parameters.Length} 個, 使用容量 {cost}/256");
+
+                var faceVar = ep.parameters.FirstOrDefault(p => p != null && p.name == "Face_variation");
+                var faceLock = ep.parameters.FirstOrDefault(p => p != null && p.name == "FaceLock");
+                Debug.Log($"  - Face_variation: {(faceVar != null ? faceVar.valueType.ToString() : "なし")}");
+                Debug.Log($"  - FaceLock: {(faceLock != null ? faceLock.valueType.ToString() : "なし")}");
+            }
+
+            // 2) FX コントローラとパラメータ同期
+            var fx = av.specialAnimationLayers
+                .FirstOrDefault(l => l.type == VRC.SDK3.Avatars.Components.VRCAvatarDescriptor.AnimLayerType.FX).animatorController
+                as UnityEditor.Animations.AnimatorController;
+
+            if (fx == null)
+            {
+                Debug.LogWarning("[Diag] FX Controller: 未割当");
+            }
+            else
+            {
+                var fxParams = fx.parameters.Select(p => $"{p.name}({p.type})").ToArray();
+                Debug.Log($"[Diag] FX Parameters: {fx.parameters.Length} 個 -> [ {string.Join(", ", fxParams)} ]");
+
+                // 空条件と未定義パラメータチェック
+                int emptyConds = 0, missingConds = 0;
+                var epNames = new HashSet<string>(ep != null && ep.parameters != null ? ep.parameters.Where(p=>p!=null).Select(p => p.name) : Enumerable.Empty<string>());
+                foreach (var layer in fx.layers)
+                {
+                    foreach (var st in layer.stateMachine.states)
+                    {
+                        foreach (var tr in st.state.transitions)
+                        {
+                            foreach (var c in tr.conditions)
+                            {
+                                if (string.IsNullOrEmpty(c.parameter)) emptyConds++;
+                                else if (!epNames.Contains(c.parameter)) missingConds++;
+                            }
+                        }
+                    }
+                    foreach (var tr in layer.stateMachine.anyStateTransitions)
+                    {
+                        foreach (var c in tr.conditions)
+                        {
+                            if (string.IsNullOrEmpty(c.parameter)) emptyConds++;
+                            else if (!epNames.Contains(c.parameter)) missingConds++;
+                        }
+                    }
+                }
+                Debug.Log($"[Diag] FX 条件: 空={emptyConds}, 未定義={missingConds}");
+            }
+
+            // 3) Expression Menu の項目
+            var menu = av.expressionsMenu;
+            if (menu == null || menu.controls == null)
+            {
+                Debug.LogWarning("[Diag] Expression Menu: 未設定");
+            }
+            else
+            {
+                var items = menu.controls.Select(c => c != null ? $"{c.name} -> {(c.parameter != null ? c.parameter.name : "(no param)")}" : "(null)");
+                Debug.Log($"[Diag] Menu Items: {menu.controls.Count} 個 -> [ {string.Join(", ", items)} ]");
+            }
+
+            // 4) FaceEmo コンポーネントのパラメータ名
+            var faceEmos = av.GetComponentsInChildren<MonoBehaviour>(true)
+                .Where(mb => mb != null && ((mb.GetType().Name.Contains("FaceEmo")) || (mb.GetType().FullName != null && mb.GetType().FullName.Contains("FaceEmo"))))
+                .ToArray();
+            Debug.Log($"[Diag] FaceEmo components: {faceEmos.Length} 個");
+            foreach (var fe in faceEmos)
+            {
+                var so = new SerializedObject(fe);
+                var found = new List<string>();
+                var it = so.GetIterator();
+                bool enter = true;
+                while (it.NextVisible(enter))
+                {
+                    enter = false;
+                    if (it.propertyType == SerializedPropertyType.String)
+                    {
+                        var n = it.displayName.ToLower();
+                        if (n.Contains("param"))
+                        {
+                            found.Add($"{it.displayName}='{it.stringValue}'");
+                        }
+                    }
+                }
+                Debug.Log($"  - {fe.GetType().Name} on {fe.gameObject.name}: {(found.Count>0? string.Join(", ", found): "(param名らしき文字列フィールドなし)")}");
+            }
+
+            // 5) 推奨修正の要点
+            Debug.Log("[Diag] 推奨: 1) FX割当, 2) Parameters名/型一致, 3) Menu項目のParameter名一致, 4) WD統一");
+        }
+
+        EditorUtility.DisplayDialog("FaceEmo診断詳細", "Consoleに診断結果を出力しました。", "OK");
+    }
+
+    // --- Expression Menu 修正（不足パラメータの自動追加など） ---
 
     private void FixFacialExpressions()
     {
