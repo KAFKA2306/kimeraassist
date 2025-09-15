@@ -73,6 +73,14 @@ public class FixFacialExpressions : EditorWindow
             {
                 CheckExpressionMenu();
             }
+
+            if (GUILayout.Button("⚙️ 未定義パラメータを自動追加"))
+            {
+                var added = FixMissingAnimatorParameters();
+                EditorUtility.DisplayDialog("FX未定義パラメータ",
+                    added > 0 ? $"{added} 個の未定義パラメータを追加/型修正しました" : "未定義パラメータは見つかりませんでした",
+                    "OK");
+            }
         });
 
         // 4. FaceEmo設定
@@ -520,6 +528,174 @@ public class FixFacialExpressions : EditorWindow
                 EditorUtility.SetDirty(descriptor.expressionParameters);
             }
         }
+        return fixedCount;
+#else
+        return 0;
+#endif
+    }
+
+    private int FixMissingAnimatorParameters()
+    {
+#if VRC_SDK_VRCSDK3
+        int fixedCount = 0;
+        var avatarDescriptors = FindObjectsOfType<VRCAvatarDescriptor>();
+
+        foreach (var descriptor in avatarDescriptors)
+        {
+            EnsureExpressionAssets(descriptor);
+
+            if (descriptor.baseAnimationLayers == null || descriptor.baseAnimationLayers.Length <= 4)
+                continue;
+
+            var fxLayer = descriptor.baseAnimationLayers[4];
+            if (!(fxLayer.animatorController is AnimatorController controller))
+                continue;
+
+            // 1) 収集: コントローラで参照されている全パラメータと期待型を推定
+            var expected = new Dictionary<string, AnimatorControllerParameterType>();
+
+            System.Action<AnimatorStateMachine> scanStateMachine = null;
+            scanStateMachine = (sm) =>
+            {
+                foreach (var child in sm.states)
+                {
+                    var state = child.state;
+                    foreach (var tr in state.transitions)
+                    {
+                        foreach (var c in tr.conditions)
+                        {
+                            if (string.IsNullOrEmpty(c.parameter)) continue;
+
+                            var type = AnimatorControllerParameterType.Bool; // default
+                            switch (c.mode)
+                            {
+                                case AnimatorConditionMode.If:
+                                case AnimatorConditionMode.IfNot:
+                                    type = AnimatorControllerParameterType.Bool; break;
+                                case AnimatorConditionMode.Greater:
+                                case AnimatorConditionMode.Less:
+                                    type = AnimatorControllerParameterType.Float; break;
+                                case AnimatorConditionMode.Equals:
+                                case AnimatorConditionMode.NotEqual:
+                                    // 閾値が整数ならIntと推定
+                                    var isInt = Mathf.Approximately(c.threshold, Mathf.Round(c.threshold));
+                                    type = isInt ? AnimatorControllerParameterType.Int : AnimatorControllerParameterType.Float;
+                                    break;
+                                default:
+                                    type = AnimatorControllerParameterType.Float; break;
+                            }
+
+                            if (!expected.TryGetValue(c.parameter, out var existing))
+                            {
+                                expected[c.parameter] = type;
+                            }
+                            else
+                            {
+                                // 型が衝突する場合は Float を優先（最も汎用）
+                                if (existing != type)
+                                {
+                                    if (existing == AnimatorControllerParameterType.Float || type == AnimatorControllerParameterType.Float)
+                                        expected[c.parameter] = AnimatorControllerParameterType.Float;
+                                    else
+                                        expected[c.parameter] = AnimatorControllerParameterType.Int; // Bool vs Int → Int へ
+                                }
+                            }
+                        }
+                    }
+                }
+
+                foreach (var any in sm.anyStateTransitions)
+                {
+                    foreach (var c in any.conditions)
+                    {
+                        if (string.IsNullOrEmpty(c.parameter)) continue;
+                        var type = (c.mode == AnimatorConditionMode.If || c.mode == AnimatorConditionMode.IfNot)
+                            ? AnimatorControllerParameterType.Bool
+                            : (Mathf.Approximately(c.threshold, Mathf.Round(c.threshold)) ? AnimatorControllerParameterType.Int : AnimatorControllerParameterType.Float);
+
+                        if (!expected.ContainsKey(c.parameter)) expected[c.parameter] = type;
+                    }
+                }
+
+                foreach (var sub in sm.stateMachines)
+                {
+                    scanStateMachine(sub.stateMachine);
+                }
+            };
+
+            foreach (var layer in controller.layers)
+            {
+                scanStateMachine(layer.stateMachine);
+            }
+
+            // 2) FXコントローラに不足分を追加/型修正
+            foreach (var kv in expected)
+            {
+                var name = kv.Key;
+                var type = kv.Value;
+                var cp = controller.parameters.FirstOrDefault(p => p.name == name);
+                if (cp == null)
+                {
+                    controller.AddParameter(name, type);
+                    fixedCount++;
+                    Debug.Log($"✅ FXパラメータ追加: {name} ({type})");
+                }
+                else if (cp.type != type)
+                {
+                    controller.RemoveParameter(cp);
+                    controller.AddParameter(name, type);
+                    fixedCount++;
+                    Debug.Log($"✅ FXパラメータ型修正: {name} → {type}");
+                }
+            }
+            EditorUtility.SetDirty(controller);
+
+            // 3) Expression Parameters にも同期（TriggerはBool扱い）
+            if (descriptor.expressionParameters != null)
+            {
+                var list = descriptor.expressionParameters.parameters?.ToList() ?? new List<VRCExpressionParameters.Parameter>();
+                var names = new HashSet<string>(list.Select(p => p.name));
+
+                int cost = list.Sum(p => p.valueType == VRCExpressionParameters.ValueType.Bool ? 1 : 4);
+                foreach (var kv in expected)
+                {
+                    var name = kv.Key;
+                    var vt = VRCExpressionParameters.ValueType.Float;
+                    switch (kv.Value)
+                    {
+                        case AnimatorControllerParameterType.Bool: vt = VRCExpressionParameters.ValueType.Bool; break;
+                        case AnimatorControllerParameterType.Int: vt = VRCExpressionParameters.ValueType.Int; break;
+                        default: vt = VRCExpressionParameters.ValueType.Float; break;
+                    }
+
+                    int addCost = vt == VRCExpressionParameters.ValueType.Bool ? 1 : 4;
+                    if (!names.Contains(name))
+                    {
+                        if (cost + addCost > 256)
+                        {
+                            Debug.LogWarning($"⚠️ Parameter容量オーバーのため追加スキップ: {name}");
+                            continue;
+                        }
+
+                        list.Add(new VRCExpressionParameters.Parameter
+                        {
+                            name = name,
+                            valueType = vt,
+                            defaultValue = 0f,
+                            saved = true
+                        });
+                        names.Add(name);
+                        cost += addCost;
+                        fixedCount++;
+                        Debug.Log($"✅ Expression Parameter追加: {name} ({vt})");
+                    }
+                }
+
+                descriptor.expressionParameters.parameters = list.ToArray();
+                EditorUtility.SetDirty(descriptor.expressionParameters);
+            }
+        }
+
         return fixedCount;
 #else
         return 0;
