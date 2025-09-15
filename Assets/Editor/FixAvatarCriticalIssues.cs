@@ -565,7 +565,7 @@ public class FixAvatarCriticalIssues : EditorWindow
                 foreach (var p in ep.parameters)
                 {
                     if (p == null) continue;
-                    int add = p.valueType == VRCExpressionsParameters.ValueType.Bool ? 1 : 4;
+                    int add = p.valueType == VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool ? 1 : 4;
                     cost += add;
                 }
                 Debug.Log($"[Diag] Expression Parameters: {ep.parameters.Length} 個, 使用容量 {cost}/256");
