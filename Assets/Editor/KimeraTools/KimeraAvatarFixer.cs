@@ -5,6 +5,7 @@ using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
 using VRC.SDK3.Avatars.Components;
+using VRC.SDK3.Avatars.ScriptableObjects;
 using UnityEditor.Animations;
 
 namespace Kimera.Editor
@@ -65,6 +66,16 @@ namespace Kimera.Editor
             catch (Exception e)
             {
                 Debug.LogWarning($"[Kimera] MergeArmature自動設定で例外: {e.Message}");
+            }
+
+            // FaceEmo 連動: Expressions(Parameters/Menu) と FX の配線を補強
+            try
+            {
+                changed += EnsureFaceEmoLinkage(descriptor);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[Kimera] FaceEmo連動設定で例外: {e.Message}");
             }
 
             // Animator の欠落/空パラメータ修正
@@ -845,6 +856,125 @@ namespace Kimera.Editor
                 }
             }
             return count;
+        }
+
+        private static int EnsureFaceEmoLinkage(VRCAvatarDescriptor descriptor)
+        {
+            int changed = 0;
+            if (descriptor == null) return 0;
+
+            // 1) Ensure Expressions assets exist
+            var menu = descriptor.expressionsMenu;
+            var parameters = descriptor.expressionParameters;
+
+            if (parameters == null)
+            {
+                // 生成して割当（プロジェクトに保存）
+                parameters = ScriptableObject.CreateInstance<VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters>();
+                parameters.parameters = Array.Empty<VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.Parameter>();
+                var path = "Assets/Generated_Kimera_ExpressionsParameters.asset";
+                AssetDatabase.CreateAsset(parameters, AssetDatabase.GenerateUniqueAssetPath(path));
+                descriptor.expressionParameters = parameters;
+                EditorUtility.SetDirty(descriptor);
+                changed++;
+                Debug.Log("[Kimera] Expression Parameters を新規作成・割当しました。");
+            }
+
+            if (menu == null)
+            {
+                menu = ScriptableObject.CreateInstance<VRCExpressionsMenu>();
+                var path = "Assets/Generated_Kimera_ExpressionsMenu.asset";
+                AssetDatabase.CreateAsset(menu, AssetDatabase.GenerateUniqueAssetPath(path));
+                descriptor.expressionsMenu = menu;
+                EditorUtility.SetDirty(descriptor);
+                changed++;
+                Debug.Log("[Kimera] Expression Menu を新規作成・割当しました。");
+            }
+
+            // 2) Ensure parameters Face_variation (Bool) and FaceLock (Float)
+            changed += EnsureParameter(parameters, "Face_variation", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool);
+            changed += EnsureParameter(parameters, "FaceLock", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Float);
+
+            // 3) Ensure menu controls exist
+            if (menu.controls == null) menu.controls = new List<VRCExpressionsMenu.Control>();
+            bool hasFaceVar = menu.controls.Any(c => (c != null && c.parameter != null && c.parameter.name == "Face_variation"));
+            bool hasFaceLock = menu.controls.Any(c => (c != null && c.parameter != null && c.parameter.name == "FaceLock"));
+
+            if (!hasFaceVar)
+            {
+                var ctrl = new VRCExpressionsMenu.Control
+                {
+                    name = "Face Variation",
+                    type = VRCExpressionsMenu.Control.ControlType.Toggle,
+                    parameter = new VRCExpressionsMenu.Control.Parameter { name = "Face_variation" }
+                };
+                menu.controls.Insert(0, ctrl);
+                EditorUtility.SetDirty(menu);
+                changed++;
+                Debug.Log("[Kimera] Expression Menu に Face_variation トグルを追加しました。");
+            }
+
+            if (!hasFaceLock)
+            {
+                var ctrl = new VRCExpressionsMenu.Control
+                {
+                    name = "Face Lock",
+                    type = VRCExpressionsMenu.Control.ControlType.RadialPuppet,
+                    parameter = new VRCExpressionsMenu.Control.Parameter { name = "FaceLock" }
+                };
+                menu.controls.Add(ctrl);
+                EditorUtility.SetDirty(menu);
+                changed++;
+                Debug.Log("[Kimera] Expression Menu に FaceLock ラジアルを追加しました。");
+            }
+
+            return changed;
+        }
+
+        private static int EnsureParameter(VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters parameters, string name, VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType type)
+        {
+            int changed = 0;
+            if (parameters.parameters == null) parameters.parameters = Array.Empty<VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.Parameter>();
+
+            var list = parameters.parameters.ToList();
+            var existing = list.FirstOrDefault(p => p != null && p.name == name);
+            if (existing != null)
+            {
+                if (existing.valueType != type)
+                {
+                    Debug.LogWarning($"[Kimera] Expression Parameter '{name}' は既に存在しますが型が異なります: {existing.valueType}。変更は行いませんでした。");
+                }
+                return 0;
+            }
+
+            // 容量チェック（Bool=1, Int/Float=4）
+            int cost = 0;
+            foreach (var p in list)
+            {
+                if (p == null) continue;
+                cost += (p.valueType == VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool) ? 1 : 4;
+            }
+            int add = (type == VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool) ? 1 : 4;
+            const int MaxCost = VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.MAX_PARAMETER_COST; // 256
+            if (cost + add > MaxCost)
+            {
+                Debug.LogWarning($"[Kimera] Expression Parameters の容量が上限({MaxCost})を超えるため '{name}' を追加できませんでした。不要なパラメータを削除してから再実行してください。");
+                return 0;
+            }
+
+            var param = new VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.Parameter
+            {
+                name = name,
+                valueType = type,
+                saved = true,
+                defaultValue = 0f
+            };
+            list.Add(param);
+            parameters.parameters = list.ToArray();
+            EditorUtility.SetDirty(parameters);
+            changed++;
+            Debug.Log($"[Kimera] Expression Parameter を追加: {name} ({type})");
+            return changed;
         }
     }
 

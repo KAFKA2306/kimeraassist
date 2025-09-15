@@ -81,6 +81,23 @@ public class FixAvatarCriticalIssues : EditorWindow
                 {
                     SafeInvoke(FixFacialExpressions);
                 }
+
+                if (GUILayout.Button("10. 🔍 FaceEmo診断詳細"))
+                {
+                    SafeInvoke(DiagnoseFaceEmoDetails);
+                }
+
+                if (GUILayout.Button("11. 🎭 Expression Menu修正"))
+                {
+                    try
+                    {
+                        FixExpressionMenuConnections();
+                    }
+                    catch (System.Exception ex)
+                    {
+                        Debug.LogException(ex);
+                    }
+                }
             });
 
             // C. ビルドテスト
@@ -622,9 +639,386 @@ public class FixAvatarCriticalIssues : EditorWindow
             }
         }
 
+        // 4. FaceEmoパラメータ連動修正
+        fixedCount += FixFaceEmoParameterSync(avatarDescriptors);
+
         Debug.Log($"✅ 表情設定を {fixedCount} 個修正");
         EditorUtility.DisplayDialog("表情設定修正",
-            fixedCount > 0 ? $"表情設定を {fixedCount} 個修正しました\n\n- 顔メッシュ自動設定\n- FXレイヤー有効化\n- FaceEmo有効化" : "表情設定に問題は見つかりません",
+            fixedCount > 0 ? $"表情設定を {fixedCount} 個修正しました\n\n- 顔メッシュ自動設定\n- FXレイヤー有効化\n- FaceEmo復旧・有効化\n- パラメータ連動修正" : "表情設定に問題は見つかりません",
+            "OK");
+    }
+
+    private int FixFaceEmoParameterSync(VRC.SDK3.Avatars.Components.VRCAvatarDescriptor[] avatarDescriptors)
+    {
+        int fixedCount = 0;
+
+        foreach (var descriptor in avatarDescriptors)
+        {
+            // Expression Parametersの確認・修正
+            if (descriptor.expressionParameters != null)
+            {
+                var parameters = descriptor.expressionParameters.parameters.ToList();
+                bool parametersModified = false;
+
+                // FaceEmo用の重要パラメータを確認・追加
+                var requiredParams = new[]
+                {
+                    ("FaceEmoteSelect", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Int),
+                    ("FaceLock", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Float),
+                    ("Face_variation", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool)
+                };
+
+                foreach (var (paramName, paramType) in requiredParams)
+                {
+                    var existingParam = parameters.FirstOrDefault(p => p.name == paramName);
+                    if (existingParam == null)
+                    {
+                        // パラメータが存在しない場合は追加
+                        if (parameters.Count < 128) // VRChatのパラメータ制限
+                        {
+                            var newParam = new VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.Parameter
+                            {
+                                name = paramName,
+                                valueType = paramType,
+                                defaultValue = 0f,
+                                saved = paramType != VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool
+                            };
+                            parameters.Add(newParam);
+                            parametersModified = true;
+                            Debug.Log($"✅ パラメータ追加: {paramName} ({paramType})");
+                            fixedCount++;
+                        }
+                    }
+                    else
+                    {
+                        // パラメータが存在するが型が違う場合は修正
+                        if (existingParam.valueType != paramType)
+                        {
+                            existingParam.valueType = paramType;
+                            parametersModified = true;
+                            Debug.Log($"✅ パラメータ型修正: {paramName} → {paramType}");
+                            fixedCount++;
+                        }
+                    }
+                }
+
+                if (parametersModified)
+                {
+                    descriptor.expressionParameters.parameters = parameters.ToArray();
+                    EditorUtility.SetDirty(descriptor.expressionParameters);
+                }
+            }
+
+            // FXコントローラーのパラメータ同期確認
+            if (descriptor.baseAnimationLayers != null && descriptor.baseAnimationLayers.Length > 4)
+            {
+                var fxLayer = descriptor.baseAnimationLayers[4];
+                if (fxLayer.animatorController is UnityEditor.Animations.AnimatorController controller)
+                {
+                    var controllerParams = controller.parameters.ToList();
+                    bool controllerModified = false;
+
+                    // Expression Parametersと同期
+                    if (descriptor.expressionParameters != null)
+                    {
+                        foreach (var expParam in descriptor.expressionParameters.parameters)
+                        {
+                            if (expParam.name.Contains("Face") || expParam.name.Contains("Emote"))
+                            {
+                                var existingControllerParam = controllerParams.FirstOrDefault(p => p.name == expParam.name);
+                                if (existingControllerParam == null)
+                                {
+                                    // FXコントローラーにパラメータを追加
+                                    AnimatorControllerParameterType controllerType;
+                                    switch (expParam.valueType)
+                                    {
+                                        case VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Bool:
+                                            controllerType = AnimatorControllerParameterType.Bool;
+                                            break;
+                                        case VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Int:
+                                            controllerType = AnimatorControllerParameterType.Int;
+                                            break;
+                                        default:
+                                            controllerType = AnimatorControllerParameterType.Float;
+                                            break;
+                                    }
+
+                                    controller.AddParameter(expParam.name, controllerType);
+                                    controllerModified = true;
+                                    Debug.Log($"✅ FXパラメータ追加: {expParam.name} ({controllerType})");
+                                    fixedCount++;
+                                }
+                            }
+                        }
+                    }
+
+                    if (controllerModified)
+                    {
+                        EditorUtility.SetDirty(controller);
+                    }
+                }
+            }
+
+            // FaceEmoコンポーネントの再初期化
+            var faceEmoComponents = descriptor.GetComponentsInChildren<MonoBehaviour>(true)
+                .Where(mb => mb != null && mb.GetType().Name.Contains("FaceEmo"))
+                .ToArray();
+
+            foreach (var faceEmo in faceEmoComponents)
+            {
+                try
+                {
+                    // FaceEmoの設定更新（リフレクションを使用）
+                    var setupMethod = faceEmo.GetType().GetMethod("Setup",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                    if (setupMethod != null)
+                    {
+                        setupMethod.Invoke(faceEmo, null);
+                        Debug.Log($"✅ FaceEmo再初期化: {faceEmo.name}");
+                        fixedCount++;
+                    }
+
+                    // パラメータ名の確認・修正
+                    var parameterField = faceEmo.GetType().GetField("parameterName",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                    if (parameterField != null)
+                    {
+                        var currentParam = parameterField.GetValue(faceEmo) as string;
+                        if (string.IsNullOrEmpty(currentParam) || currentParam == "")
+                        {
+                            parameterField.SetValue(faceEmo, "FaceEmoteSelect");
+                            Debug.Log($"✅ FaceEmoパラメータ名設定: {faceEmo.name} → FaceEmoteSelect");
+                            fixedCount++;
+                        }
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogWarning($"FaceEmo設定更新失敗: {ex.Message}");
+                }
+            }
+        }
+
+        return fixedCount;
+    }
+
+    private void DiagnoseFaceEmoDetails()
+    {
+        var avatarDescriptors = FindObjectsOfType<VRC.SDK3.Avatars.Components.VRCAvatarDescriptor>();
+
+        foreach (var descriptor in avatarDescriptors)
+        {
+            Debug.Log($"\n🔍 詳細診断: {descriptor.name}");
+
+            // 1. Expression Parameters詳細
+            if (descriptor.expressionParameters != null)
+            {
+                Debug.Log($"📋 Expression Parameters: {descriptor.expressionParameters.name}");
+                Debug.Log($"   パラメータ数: {descriptor.expressionParameters.parameters.Length}");
+
+                var faceParams = descriptor.expressionParameters.parameters
+                    .Where(p => p.name.Contains("Face") || p.name.Contains("Emote"))
+                    .ToArray();
+
+                Debug.Log($"   表情関連パラメータ: {faceParams.Length} 個");
+                foreach (var param in faceParams)
+                {
+                    Debug.Log($"     - {param.name} ({param.valueType}) = {param.defaultValue}");
+                }
+
+                // 重要パラメータの存在確認
+                var requiredParams = new[] { "FaceEmoteSelect", "FaceLock", "Face_variation" };
+                foreach (var reqParam in requiredParams)
+                {
+                    var exists = faceParams.Any(p => p.name == reqParam);
+                    Debug.Log($"   {reqParam}: {(exists ? "✅ 存在" : "❌ 不足")}");
+                }
+            }
+            else
+            {
+                Debug.LogWarning($"❌ Expression Parameters が未設定: {descriptor.name}");
+            }
+
+            // 2. FXコントローラー詳細
+            if (descriptor.baseAnimationLayers != null && descriptor.baseAnimationLayers.Length > 4)
+            {
+                var fxLayer = descriptor.baseAnimationLayers[4];
+                if (fxLayer.animatorController is UnityEditor.Animations.AnimatorController controller)
+                {
+                    Debug.Log($"🎮 FXController: {controller.name}");
+
+                    var faceControllerParams = controller.parameters
+                        .Where(p => p.name.Contains("Face") || p.name.Contains("Emote"))
+                        .ToArray();
+
+                    Debug.Log($"   表情関連パラメータ: {faceControllerParams.Length} 個");
+                    foreach (var param in faceControllerParams)
+                    {
+                        Debug.Log($"     - {param.name} ({param.type}) = {param.defaultFloat}");
+                    }
+                }
+            }
+
+            // 3. FaceEmoコンポーネント詳細
+            var faceEmoComponents = descriptor.GetComponentsInChildren<MonoBehaviour>(true)
+                .Where(mb => mb != null && mb.GetType().Name.Contains("FaceEmo"))
+                .ToArray();
+
+            Debug.Log($"😄 FaceEmoコンポーネント: {faceEmoComponents.Length} 個");
+
+            foreach (var faceEmo in faceEmoComponents)
+            {
+                Debug.Log($"   - {faceEmo.GetType().Name} on {faceEmo.gameObject.name}");
+                Debug.Log($"     有効: {faceEmo.enabled}");
+
+                // パラメータ名を取得
+                try
+                {
+                    var parameterField = faceEmo.GetType().GetField("parameterName",
+                        System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+                    if (parameterField != null)
+                    {
+                        var paramName = parameterField.GetValue(faceEmo) as string;
+                        Debug.Log($"     パラメータ名: '{paramName}' {(string.IsNullOrEmpty(paramName) ? "❌ 空" : "✅ 設定済み")}");
+                    }
+
+                    // その他の重要フィールドも確認
+                    var fields = faceEmo.GetType().GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+                    foreach (var field in fields.Take(5)) // 最初の5個のフィールドのみ
+                    {
+                        var value = field.GetValue(faceEmo);
+                        Debug.Log($"     {field.Name}: {value}");
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogWarning($"     フィールド取得エラー: {ex.Message}");
+                }
+            }
+        }
+
+        EditorUtility.DisplayDialog("FaceEmo詳細診断",
+            "FaceEmoの詳細情報をConsoleに出力しました\n\nパラメータ連動の問題を特定してください", "OK");
+    }
+
+    private void FixExpressionMenuConnections()
+    {
+        var avatarDescriptors = FindObjectsOfType<VRC.SDK3.Avatars.Components.VRCAvatarDescriptor>();
+        int fixedCount = 0;
+
+        foreach (var descriptor in avatarDescriptors)
+        {
+            Debug.Log($"\n🎭 Expression Menu修正: {descriptor.name}");
+
+            if (descriptor.expressionsMenu == null)
+            {
+                Debug.LogWarning($"❌ Expression Menu が未設定: {descriptor.name}");
+                continue;
+            }
+
+            var menu = descriptor.expressionsMenu;
+            var parameters = descriptor.expressionParameters;
+
+            if (parameters == null)
+            {
+                Debug.LogWarning($"❌ Expression Parameters が未設定: {descriptor.name}");
+                continue;
+            }
+
+            // 表情関連のメニューコントロールを確認・修正
+            foreach (var control in menu.controls)
+            {
+                if (control == null || control.parameter == null) continue;
+
+                var paramName = control.parameter.name;
+
+                // 表情関連パラメータの確認
+                if (paramName.Contains("Face") || paramName.Contains("Emote") || paramName.Contains("Expression"))
+                {
+                    Debug.Log($"🔍 Expression Menu Control: {control.name} → {paramName}");
+
+                    // Expression Parametersに対応するパラメータが存在するか確認
+                    var expParam = parameters.parameters.FirstOrDefault(p => p.name == paramName);
+                    if (expParam == null)
+                    {
+                        Debug.LogWarning($"⚠️ パラメータ不一致: Menu '{paramName}' がExpression Parametersに存在しません");
+
+                        // 類似パラメータを検索して提案
+                        var similarParams = parameters.parameters
+                            .Where(p => p.name.Contains("Face") || p.name.Contains("Emote"))
+                            .ToArray();
+
+                        if (similarParams.Length > 0)
+                        {
+                            var suggestion = similarParams[0].name;
+                            Debug.Log($"💡 提案: '{paramName}' → '{suggestion}' に変更を検討");
+
+                            // 自動修正: 一般的なパラメータ名の場合
+                            if (paramName == "FaceEmote" || paramName == "Emote" || paramName == "EmoteSelect")
+                            {
+                                control.parameter.name = "FaceEmoteSelect";
+                                Debug.Log($"✅ 自動修正: {paramName} → FaceEmoteSelect");
+                                fixedCount++;
+                            }
+                        }
+                    }
+
+                    // パラメータ型の確認
+                    if (expParam != null)
+                    {
+                        var expectedType = control.type == VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionsMenu.Control.ControlType.RadialPuppet
+                            ? VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Float
+                            : VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Int;
+
+                        if (expParam.valueType != expectedType)
+                        {
+                            Debug.LogWarning($"⚠️ パラメータ型不一致: {paramName} Menu:{control.type} vs Param:{expParam.valueType}");
+                        }
+                    }
+                }
+            }
+
+            // 基本的な表情パラメータが不足している場合の自動追加
+            var requiredParams = new[]
+            {
+                ("FaceEmoteSelect", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Int),
+                ("FaceLock", VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.ValueType.Float)
+            };
+
+            var paramList = parameters.parameters.ToList();
+            bool parametersModified = false;
+
+            foreach (var (reqName, reqType) in requiredParams)
+            {
+                if (!paramList.Any(p => p.name == reqName))
+                {
+                    var newParam = new VRC.SDK3.Avatars.ScriptableObjects.VRCExpressionParameters.Parameter
+                    {
+                        name = reqName,
+                        valueType = reqType,
+                        defaultValue = 0f,
+                        saved = true
+                    };
+                    paramList.Add(newParam);
+                    parametersModified = true;
+                    Debug.Log($"✅ 不足パラメータ追加: {reqName} ({reqType})");
+                    fixedCount++;
+                }
+            }
+
+            if (parametersModified)
+            {
+                parameters.parameters = paramList.ToArray();
+                EditorUtility.SetDirty(parameters);
+            }
+        }
+
+        Debug.Log($"✅ Expression Menu修正完了: {fixedCount} 個の問題を修正");
+        EditorUtility.DisplayDialog("Expression Menu修正",
+            fixedCount > 0 ? $"Expression Menuの {fixedCount} 個の問題を修正しました\n\n- パラメータ名の統一\n- 不足パラメータの追加\n- 型の確認" : "Expression Menuに問題は見つかりませんでした",
             "OK");
     }
 }
