@@ -467,6 +467,15 @@ public class FixFacialExpressions : EditorWindow
             var list = descriptor.expressionParameters.parameters.ToList();
             var names = new HashSet<string>(list.Select(p => p.name));
 
+            // FaceEmoでよく使う既定パラメータの期待型
+            System.Func<string, VRCExpressionParameters.ValueType?> expectedTypeFor = (paramName) =>
+            {
+                if (paramName == "FaceEmoteSelect") return VRCExpressionParameters.ValueType.Int;
+                if (paramName == "FaceLock") return VRCExpressionParameters.ValueType.Float;
+                if (paramName == "Face_variation") return VRCExpressionParameters.ValueType.Bool;
+                return null;
+            };
+
             foreach (var control in descriptor.expressionsMenu.controls)
             {
                 if (control == null || control.parameter == null) continue;
@@ -475,14 +484,15 @@ public class FixFacialExpressions : EditorWindow
 
                 if (!names.Contains(name))
                 {
+                    var vt = expectedTypeFor(name) ?? VRCExpressionParameters.ValueType.Bool;
                     list.Add(new VRCExpressionParameters.Parameter
                     {
                         name = name,
-                        valueType = VRCExpressionParameters.ValueType.Bool
+                        valueType = vt
                     });
                     names.Add(name);
                     fixedCount++;
-                    Debug.Log($"✅ Expression Parameter追加: {name}");
+                    Debug.Log($"✅ Expression Parameter追加: {name} ({vt})");
                 }
 
                 if (descriptor.baseAnimationLayers != null && descriptor.baseAnimationLayers.Length > 4)
@@ -491,10 +501,15 @@ public class FixFacialExpressions : EditorWindow
                     if (fxLayer.animatorController is AnimatorController controller &&
                         !controller.parameters.Any(p => p.name == name))
                     {
-                        controller.AddParameter(name, AnimatorControllerParameterType.Bool);
+                        var vt = expectedTypeFor(name);
+                        var ct = AnimatorControllerParameterType.Bool;
+                        if (vt == VRCExpressionParameters.ValueType.Int) ct = AnimatorControllerParameterType.Int;
+                        else if (vt == VRCExpressionParameters.ValueType.Float) ct = AnimatorControllerParameterType.Float;
+
+                        controller.AddParameter(name, ct);
                         EditorUtility.SetDirty(controller);
                         fixedCount++;
-                        Debug.Log($"✅ FXパラメータ追加: {name}");
+                        Debug.Log($"✅ FXパラメータ追加: {name} ({ct})");
                     }
                 }
             }
@@ -553,31 +568,47 @@ public class FixFacialExpressions : EditorWindow
             EnsureExpressionAssets(descriptor);
             fixedCount += SyncMenuParameters(descriptor);
 
-            // Expression Parametersの確認・追加
+            // Expression Parametersの確認・追加（FaceEmo連動の必須セット）
             if (descriptor.expressionParameters != null)
             {
                 var parameters = descriptor.expressionParameters.parameters.ToList();
-                var faceSelect = parameters.FirstOrDefault(p => p.name == "FaceEmoteSelect");
-                if (faceSelect == null)
+
+                var required = new (string name, VRCExpressionParameters.ValueType type)[]
                 {
-                    parameters.Add(new VRCExpressionParameters.Parameter
+                    ("FaceEmoteSelect", VRCExpressionParameters.ValueType.Int),
+                    ("FaceLock", VRCExpressionParameters.ValueType.Float),
+                    ("Face_variation", VRCExpressionParameters.ValueType.Bool),
+                };
+
+                bool modified = false;
+                foreach (var (name, type) in required)
+                {
+                    var p = parameters.FirstOrDefault(x => x.name == name);
+                    if (p == null)
                     {
-                        name = "FaceEmoteSelect",
-                        valueType = VRCExpressionParameters.ValueType.Int,
-                        defaultValue = 0f
-                    });
-                    descriptor.expressionParameters.parameters = parameters.ToArray();
-                    EditorUtility.SetDirty(descriptor.expressionParameters);
-                    fixedCount++;
-                    Debug.Log("✅ パラメータ追加: FaceEmoteSelect");
+                        parameters.Add(new VRCExpressionParameters.Parameter
+                        {
+                            name = name,
+                            valueType = type,
+                            defaultValue = 0f
+                        });
+                        fixedCount++;
+                        modified = true;
+                        Debug.Log($"✅ パラメータ追加: {name} ({type})");
+                    }
+                    else if (p.valueType != type)
+                    {
+                        p.valueType = type;
+                        fixedCount++;
+                        modified = true;
+                        Debug.Log($"✅ パラメータ型修正: {name} → {type}");
+                    }
                 }
-                else if (faceSelect.valueType != VRCExpressionParameters.ValueType.Int)
+
+                if (modified)
                 {
-                    faceSelect.valueType = VRCExpressionParameters.ValueType.Int;
                     descriptor.expressionParameters.parameters = parameters.ToArray();
                     EditorUtility.SetDirty(descriptor.expressionParameters);
-                    fixedCount++;
-                    Debug.Log("✅ FaceEmoteSelect の型を Int に修正");
                 }
             }
 
@@ -587,14 +618,35 @@ public class FixFacialExpressions : EditorWindow
                 var fxLayer = descriptor.baseAnimationLayers[4];
                 if (fxLayer.animatorController is AnimatorController controller)
                 {
-                    var param = controller.parameters.FirstOrDefault(p => p.name == "FaceEmoteSelect");
-                    if (param == null)
+                    // Ensure all required params exist in FX with correct types
+                    System.Action<string, VRCExpressionParameters.ValueType> ensureFXParam = (name, type) =>
                     {
-                        controller.AddParameter("FaceEmoteSelect", AnimatorControllerParameterType.Int);
-                        EditorUtility.SetDirty(controller);
-                        fixedCount++;
-                        Debug.Log("✅ FXパラメータ追加: FaceEmoteSelect");
-                    }
+                        var existing = controller.parameters.FirstOrDefault(p => p.name == name);
+                        var ct = AnimatorControllerParameterType.Bool;
+                        if (type == VRCExpressionParameters.ValueType.Int) ct = AnimatorControllerParameterType.Int;
+                        else if (type == VRCExpressionParameters.ValueType.Float) ct = AnimatorControllerParameterType.Float;
+
+                        if (existing == null)
+                        {
+                            controller.AddParameter(name, ct);
+                            EditorUtility.SetDirty(controller);
+                            fixedCount++;
+                            Debug.Log($"✅ FXパラメータ追加: {name} ({ct})");
+                        }
+                        else if (existing.type != ct)
+                        {
+                            // Replace by removing and re-adding to correct type
+                            controller.RemoveParameter(existing);
+                            controller.AddParameter(name, ct);
+                            EditorUtility.SetDirty(controller);
+                            fixedCount++;
+                            Debug.Log($"✅ FXパラメータ型修正: {name} → {ct}");
+                        }
+                    };
+
+                    ensureFXParam("FaceEmoteSelect", VRCExpressionParameters.ValueType.Int);
+                    ensureFXParam("FaceLock", VRCExpressionParameters.ValueType.Float);
+                    ensureFXParam("Face_variation", VRCExpressionParameters.ValueType.Bool);
 
                     CleanUpFXController(controller, descriptor.expressionParameters);
                     UnifyWriteDefaults(controller, false);
