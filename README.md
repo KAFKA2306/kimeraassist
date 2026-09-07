@@ -6,6 +6,23 @@ Unity上のVRChatアバターで発生する、Expression Parameters、FX Animat
 
 特定のアバターで発生した問題を解決するために作られたコードを含みます。すべてのアバター・SDK・ツール構成へ安全に適用できる汎用修復ツールではありません。
 
+## Vision
+
+壊れたアバターを自動で全部直すことではなく、何が壊れているかを先に見つけ、変更予定を理解し、必要な箇所だけ直して差分と実動作を確認できるトラブルシューティング体験を作ります。
+
+## Design philosophy
+
+- diagnosisとmutationを分離する
+- automatic repairより原因理解と差分確認を優先する
+- backup、Git差分、Undo可能性を先に確保する
+- Expression Parameters、Animator、Bounds、PhysBoneなどを別のfailure domainとして扱う
+- Unity上の修復成功をVRChat runtime成功として扱わない
+- 同名parameterやmissing referenceを意味確認なしに一括修復しない
+
+## Why / 差別化
+
+価値はEditor scriptの数ではありません。症状を確認し、診断し、限定的に修復し、差分を確認し、Play Mode、SDK Build & Test、必要ならVRChat内確認へ進む一連の安全な切り分けを同じ流れで実行できることにあります。
+
 ## 主な機能
 
 コミット履歴で確認できる主な処理:
@@ -124,4 +141,4 @@ README作成時点では、正確なUnity、VRChat SDK、VRCFury、Modular Avata
 - 修復後の動作・アップロード可否は利用者が確認してください
 - 問題の原因が分からない状態で「全部修復」を実行しないでください
 
-**README最終監査:** 2026-08-01
+**README最終監査:** 2026-09-07
